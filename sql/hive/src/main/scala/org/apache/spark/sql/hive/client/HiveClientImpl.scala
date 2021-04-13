@@ -19,6 +19,7 @@ package org.apache.spark.sql.hive.client
 
 import java.io.{File, PrintStream}
 import java.lang.{Iterable => JIterable}
+import java.lang.reflect.InvocationTargetException
 import java.util.{Locale, Map => JMap}
 
 import scala.collection.JavaConverters._
@@ -30,10 +31,10 @@ import org.apache.hadoop.hive.common.StatsSetupConst
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
 import org.apache.hadoop.hive.metastore.{TableType => HiveTableType}
-import org.apache.hadoop.hive.metastore.api.{Database => HiveDatabase, FieldSchema, Order}
+import org.apache.hadoop.hive.metastore.api.{AlreadyExistsException, Database => HiveDatabase, FieldSchema, Order}
 import org.apache.hadoop.hive.metastore.api.{SerDeInfo, StorageDescriptor}
 import org.apache.hadoop.hive.ql.Driver
-import org.apache.hadoop.hive.ql.metadata.{Hive, Partition => HivePartition, Table => HiveTable}
+import org.apache.hadoop.hive.ql.metadata.{Hive, HiveException, Partition => HivePartition, Table => HiveTable}
 import org.apache.hadoop.hive.ql.parse.BaseSemanticAnalyzer.HIVE_COLUMN_ORDER_ASC
 import org.apache.hadoop.hive.ql.processors._
 import org.apache.hadoop.hive.ql.session.SessionState
@@ -43,15 +44,16 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.metrics.source.HiveCatalogMetrics
 import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchPartitionException}
+import org.apache.spark.sql.catalyst.analysis.{NoSuchDatabaseException, NoSuchPartitionException, NoSuchPartitionsException, PartitionsAlreadyExistException}
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions.Expression
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParseException}
 import org.apache.spark.sql.execution.QueryExecutionException
-import org.apache.spark.sql.execution.command.DDLUtils
+import org.apache.spark.sql.hive.HiveExternalCatalog
 import org.apache.spark.sql.hive.HiveExternalCatalog.{DATASOURCE_SCHEMA, DATASOURCE_SCHEMA_NUMPARTS, DATASOURCE_SCHEMA_PART_PREFIX}
 import org.apache.spark.sql.hive.client.HiveClientImpl._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.util.{CircularBuffer, Utils}
 
@@ -167,14 +169,15 @@ private[hive] class HiveClientImpl(
     // has hive-site.xml. So, HiveConf will use that to override its default values.
     // 2: we set all spark confs to this hiveConf.
     // 3: we set all entries in config to this hiveConf.
-    (hadoopConf.iterator().asScala.map(kv => kv.getKey -> kv.getValue)
-      ++ sparkConf.getAll.toMap ++ extraConfig).foreach { case (k, v) =>
+    val confMap = (hadoopConf.iterator().asScala.map(kv => kv.getKey -> kv.getValue) ++
+      sparkConf.getAll.toMap ++ extraConfig).toMap
+    confMap.foreach { case (k, v) => hiveConf.set(k, v) }
+    SQLConf.get.redactOptions(confMap).foreach { case (k, v) =>
       logDebug(
         s"""
            |Applying Hadoop/Hive/Spark and extra properties to Hive Conf:
-           |$k=${if (k.toLowerCase(Locale.ROOT).contains("password")) "xxx" else v}
+           |$k=$v
          """.stripMargin)
-      hiveConf.set(k, v)
     }
     val state = new SessionState(hiveConf)
     if (clientLoader.cachedHive != null) {
@@ -539,7 +542,17 @@ private[hive] class HiveClientImpl(
       table: String,
       parts: Seq[CatalogTablePartition],
       ignoreIfExists: Boolean): Unit = withHiveState {
-    shim.createPartitions(client, db, table, parts, ignoreIfExists)
+    def replaceExistException(e: Throwable): Unit = e match {
+      case _: HiveException if e.getCause.isInstanceOf[AlreadyExistsException] =>
+        throw new PartitionsAlreadyExistException(db, table, parts.map(_.spec))
+      case _ => throw e
+    }
+    try {
+      shim.createPartitions(client, db, table, parts, ignoreIfExists)
+    } catch {
+      case e: InvocationTargetException => replaceExistException(e.getCause)
+      case e: Throwable => replaceExistException(e)
+    }
   }
 
   override def dropPartitions(
@@ -560,9 +573,7 @@ private[hive] class HiveClientImpl(
         // (b='1', c='1') and (b='1', c='2'), a partial spec of (b='1') will match both.
         val parts = client.getPartitions(hiveTable, s.asJava).asScala
         if (parts.isEmpty && !ignoreIfNotExists) {
-          throw new AnalysisException(
-            s"No partition is dropped. One partition spec '$s' does not exist in table '$table' " +
-            s"database '$db'")
+          throw new NoSuchPartitionsException(db, table, Seq(s))
         }
         parts.map(_.getValues)
       }.distinct
@@ -938,7 +949,7 @@ private[hive] object HiveClientImpl {
     }
     hiveTable.setFields(schema.asJava)
     hiveTable.setPartCols(partCols.asJava)
-    userName.foreach(hiveTable.setOwner)
+    Option(table.owner).filter(_.nonEmpty).orElse(userName).foreach(hiveTable.setOwner)
     hiveTable.setCreateTime((table.createTime / 1000).toInt)
     hiveTable.setLastAccessTime((table.lastAccessTime / 1000).toInt)
     table.storage.locationUri.map(CatalogUtils.URIToString).foreach { loc =>
@@ -959,7 +970,7 @@ private[hive] object HiveClientImpl {
     }
 
     table.bucketSpec match {
-      case Some(bucketSpec) if DDLUtils.isHiveTable(table) =>
+      case Some(bucketSpec) if !HiveExternalCatalog.isDatasourceTable(table) =>
         hiveTable.setNumBuckets(bucketSpec.numBuckets)
         hiveTable.setBucketCols(bucketSpec.bucketColumnNames.toList.asJava)
 

@@ -702,10 +702,14 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
     manager.add(3, () => output += 3)
     manager.add(2, () => output += 2)
     manager.add(4, () => output += 4)
+    manager.add(Int.MinValue, () => output += Int.MinValue)
+    manager.add(Int.MinValue, () => output += Int.MinValue)
+    manager.add(Int.MaxValue, () => output += Int.MaxValue)
+    manager.add(Int.MaxValue, () => output += Int.MaxValue)
     manager.remove(hook1)
 
     manager.runAll()
-    assert(output.toList === List(4, 3, 2))
+    assert(output.toList === List(Int.MaxValue, Int.MaxValue, 4, 3, 2, Int.MinValue, Int.MinValue))
   }
 
   test("isInDirectory") {
@@ -1009,11 +1013,13 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
     // Set some secret keys
     val secretKeys = Seq(
       "spark.executorEnv.HADOOP_CREDSTORE_PASSWORD",
+      "spark.hadoop.fs.s3a.access.key",
       "spark.my.password",
       "spark.my.sECreT")
     secretKeys.foreach { key => sparkConf.set(key, "sensitive_value") }
     // Set a non-secret key
     sparkConf.set("spark.regular.property", "regular_value")
+    sparkConf.set("spark.hadoop.fs.s3a.access_key", "regular_value")
     // Set a property with a regular key but secret in the value
     sparkConf.set("spark.sensitive.property", "has_secret_in_value")
 
@@ -1024,7 +1030,8 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
     secretKeys.foreach { key => assert(redactedConf(key) === Utils.REDACTION_REPLACEMENT_TEXT) }
     assert(redactedConf("spark.regular.property") === "regular_value")
     assert(redactedConf("spark.sensitive.property") === Utils.REDACTION_REPLACEMENT_TEXT)
-
+    assert(redactedConf("spark.hadoop.fs.s3a.access.key") === Utils.REDACTION_REPLACEMENT_TEXT)
+    assert(redactedConf("spark.hadoop.fs.s3a.access_key") === "regular_value")
   }
 
   test("tryWithSafeFinally") {
@@ -1166,6 +1173,10 @@ class UtilsSuite extends SparkFunSuite with ResetSystemProperties with Logging {
 
     intercept[IllegalArgumentException] {
       Utils.checkAndGetK8sMasterUrl("k8s://foo://host:port")
+    }
+
+    intercept[IllegalArgumentException] {
+      Utils.checkAndGetK8sMasterUrl("k8s:///https://host:port")
     }
   }
 

@@ -74,7 +74,7 @@ object ScalaReflection extends ScalaReflection {
   /**
    * Synchronize to prevent concurrent usage of `<:<` operator.
    * This operator is not thread safe in any current version of scala; i.e.
-   * (2.11.12, 2.12.8, 2.13.0-M5).
+   * (2.11.12, 2.12.10, 2.13.0-M5).
    *
    * See https://github.com/scala/bug/issues/10766
    */
@@ -114,8 +114,8 @@ object ScalaReflection extends ScalaReflection {
    * Given a type `T` this function constructs `ObjectType` that holds a class of type
    * `Array[T]`.
    *
-   * Special handling is performed for primitive types to map them back to their raw
-   * JVM form instead of the Scala Array that handles auto boxing.
+   * Special handling is performed for primitive types, Array[Byte], CalendarInterval and Decimal
+   * to map them back to their raw JVM form instead of the Scala Array that handles auto boxing.
    */
   private def arrayClassFor(tpe: `Type`): ObjectType = cleanUpReflectionObjects {
     val cls = tpe.dealias match {
@@ -126,6 +126,9 @@ object ScalaReflection extends ScalaReflection {
       case t if isSubtype(t, definitions.ShortTpe) => classOf[Array[Short]]
       case t if isSubtype(t, definitions.ByteTpe) => classOf[Array[Byte]]
       case t if isSubtype(t, definitions.BooleanTpe) => classOf[Array[Boolean]]
+      case t if isSubtype(t, localTypeOf[Array[Byte]]) => classOf[Array[Array[Byte]]]
+      case t if isSubtype(t, localTypeOf[CalendarInterval]) => classOf[Array[CalendarInterval]]
+      case t if isSubtype(t, localTypeOf[Decimal]) => classOf[Array[Decimal]]
       case other =>
         // There is probably a better way to do this, but I couldn't find it...
         val elementType = dataTypeFor(other).asInstanceOf[ObjectType].cls

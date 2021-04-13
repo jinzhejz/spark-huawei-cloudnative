@@ -137,7 +137,7 @@ private[mesos] object MesosSchedulerBackendUtil extends Logging {
     val containerInfo = ContainerInfo.newBuilder()
       .setType(containerType)
 
-    conf.getOption("spark.mesos.executor.docker.image").map { image =>
+    conf.getOption("spark.mesos.executor.docker.image").foreach { image =>
       val forcePullImage = conf
         .getOption("spark.mesos.executor.docker.forcePullImage")
         .exists(_.equals("true"))
@@ -153,7 +153,9 @@ private[mesos] object MesosSchedulerBackendUtil extends Logging {
         .getOrElse(List.empty)
 
       if (containerType == ContainerInfo.Type.DOCKER) {
-        containerInfo.setDocker(dockerInfo(image, forcePullImage, portMaps, params))
+        containerInfo.setDocker(
+          dockerInfo(image, forcePullImage, portMaps, params, conf.get(NETWORK_NAME))
+        )
       } else {
         containerInfo.setMesos(mesosInfo(image, forcePullImage))
       }
@@ -263,12 +265,23 @@ private[mesos] object MesosSchedulerBackendUtil extends Logging {
       image: String,
       forcePullImage: Boolean,
       portMaps: List[ContainerInfo.DockerInfo.PortMapping],
-      params: List[Parameter]): DockerInfo = {
+      params: List[Parameter],
+      networkName: Option[String]): DockerInfo = {
     val dockerBuilder = ContainerInfo.DockerInfo.newBuilder()
       .setImage(image)
       .setForcePullImage(forcePullImage)
     portMaps.foreach(dockerBuilder.addPortMappings(_))
     params.foreach(dockerBuilder.addParameters(_))
+
+    networkName.foreach { net =>
+      val network = Parameter.newBuilder()
+        .setKey("net")
+        .setValue(net)
+        .build()
+
+      dockerBuilder.setNetwork(DockerInfo.Network.USER)
+      dockerBuilder.addParameters(network)
+    }
 
     dockerBuilder.build
   }

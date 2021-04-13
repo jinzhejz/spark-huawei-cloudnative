@@ -91,7 +91,12 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   def longMetric(name: String): SQLMetric = metrics(name)
 
   // TODO: Move to `DistributedPlan`
-  /** Specifies how data is partitioned across different nodes in the cluster. */
+  /**
+   * Specifies how data is partitioned across different nodes in the cluster.
+   * Note this method may fail if it is invoked before `EnsureRequirements` is applied
+   * since `PartitioningCollection` requires all its partitionings to have
+   * the same number of partitions.
+   */
   def outputPartitioning: Partitioning = UnknownPartitioning(0) // TODO: WRONG WIDTH!
 
   /**
@@ -420,6 +425,15 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
       case (dt, index) => SortOrder(BoundReference(index, dt, nullable = true), Ascending)
     }
     newOrdering(order, Seq.empty)
+  }
+
+  /**
+   * Cleans up the resources used by the physical operator (if any). In general, all the resources
+   * should be cleaned up when the task finishes but operators like SortMergeJoinExec and LimitExec
+   * may want eager cleanup to free up tight resources (e.g., memory).
+   */
+  protected[sql] def cleanupResources(): Unit = {
+    children.foreach(_.cleanupResources())
   }
 }
 

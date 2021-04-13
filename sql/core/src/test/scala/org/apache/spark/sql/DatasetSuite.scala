@@ -18,19 +18,25 @@
 package org.apache.spark.sql
 
 import java.io.{Externalizable, ObjectInput, ObjectOutput}
+import java.net.{InetAddress, Socket}
 import java.sql.{Date, Timestamp}
 
-import org.apache.spark.SparkException
+import scala.io.Source
+
+import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.api.python.PythonServer
+import org.apache.spark.security.SocketAuthHelper
 import org.apache.spark.sql.catalyst.encoders.{OuterScopes, RowEncoder}
 import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
 import org.apache.spark.sql.catalyst.util.sideBySide
-import org.apache.spark.sql.execution.{LogicalRDD, RDDScanExec}
+import org.apache.spark.sql.execution.{LogicalRDD, QueryExecution, RDDScanExec}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.streaming.MemoryStream
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSQLContext
 import org.apache.spark.sql.types._
+import org.apache.spark.sql.util.QueryExecutionListener
 
 case class TestDataPoint(x: Int, y: Double, s: String, t: TestDataPoint2)
 case class TestDataPoint2(x: Int, s: String)
@@ -1575,6 +1581,47 @@ class DatasetSuite extends QueryTest with SharedSQLContext {
         .collect()
     }
     assert(thrownException.message.contains("Cannot up cast `id` from bigint to tinyint"))
+  }
+
+  test("SPARK-31854: Invoke in MapElementsExec should not propagate null") {
+    Seq("true", "false").foreach { wholeStage =>
+      withSQLConf(SQLConf.WHOLESTAGE_CODEGEN_ENABLED.key -> wholeStage) {
+        val ds = Seq(1.asInstanceOf[Integer], null.asInstanceOf[Integer]).toDS()
+        val expectedAnswer = Seq[(Integer, Integer)]((1, 1), (null, null))
+        checkDataset(ds.map(v => (v, v)), expectedAnswer: _*)
+      }
+    }
+  }
+
+  test("SPARK-34726: Fix collectToPython timeouts") {
+    // Lower `PythonServer.setupOneConnectionServer` timeout for this test
+    val oldTimeout = PythonServer.timeout
+    PythonServer.timeout = 1000
+
+    val listener = new QueryExecutionListener {
+      override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {}
+
+      override def onSuccess(funcName: String, qe: QueryExecution, duration: Long): Unit = {
+        // Wait longer than `PythonServer.setupOneConnectionServer` timeout
+        Thread.sleep(PythonServer.timeout + 1000)
+      }
+    }
+    try {
+      spark.listenerManager.register(listener)
+
+      val Array(port: Int, secretToPython: String) = spark.range(5).toDF().collectToPython()
+
+      // Mimic Python side
+      val socket = new Socket(InetAddress.getByAddress(Array(127, 0, 0, 1)), port)
+      val authHelper = new SocketAuthHelper(new SparkConf()) {
+        override val secret: String = secretToPython
+      }
+      authHelper.authToServer(socket)
+      Source.fromInputStream(socket.getInputStream)
+    } finally {
+      spark.listenerManager.unregister(listener)
+      PythonServer.timeout = oldTimeout
+    }
   }
 }
 

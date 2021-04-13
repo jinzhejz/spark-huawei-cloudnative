@@ -752,7 +752,7 @@ _all_complex_types = dict((v.typeName(), v)
                           for v in [ArrayType, MapType, StructType])
 
 
-_FIXED_DECIMAL = re.compile(r"decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)")
+_FIXED_DECIMAL = re.compile(r"decimal\(\s*(\d+)\s*,\s*(-?\d+)\s*\)")
 
 
 def _parse_datatype_string(s):
@@ -865,6 +865,8 @@ def _parse_datatype_json_string(json_string):
     >>> complex_maptype = MapType(complex_structtype,
     ...                           complex_arraytype, False)
     >>> check_datatype(complex_maptype)
+    >>> # Decimal with negative scale.
+    >>> check_datatype(DecimalType(1,-1))
     """
     return _parse_datatype_json_value(json.loads(json_string))
 
@@ -1465,6 +1467,12 @@ class Row(tuple):
         Return as an dict
 
         :param recursive: turns the nested Row as dict (default: False).
+
+        .. note:: If a row contains duplicate field names, e.g., the rows of a join
+            between two :class:`DataFrame` that both have the fields of same names,
+            one of the duplicate fields will be selected by ``asDict``. ``__getitem__``
+            will also return one of the duplicate fields, however returned value might
+            be different to ``asDict``.
 
         >>> Row(name="Alice", age=11).asDict() == {'name': 'Alice', 'age': 11}
         True

@@ -24,7 +24,8 @@ import org.scalatest.BeforeAndAfterAll
 import org.apache.spark.sql.catalyst.catalog._
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
-import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType}
+import org.apache.spark.sql.types.{BooleanType, IntegerType, LongType, StringType}
+import org.apache.spark.util.Utils
 
 // TODO: Refactor this to `HivePartitionFilteringSuite`
 class HiveClientSuite(version: String)
@@ -45,6 +46,7 @@ class HiveClientSuite(version: String)
 
     val hadoopConf = new Configuration()
     hadoopConf.setBoolean(tryDirectSqlKey, tryDirectSql)
+    hadoopConf.set("hive.metastore.warehouse.dir", Utils.createTempDir().toURI().toString())
     val client = buildClient(hadoopConf)
     client.runSqlHive("CREATE TABLE test (value INT) PARTITIONED BY (ds INT, h INT, chunk STRING)")
 
@@ -254,6 +256,13 @@ class HiveClientSuite(version: String)
 
   test("create client with sharesHadoopClasses = false") {
     buildClient(new Configuration(), sharesHadoopClasses = false)
+  }
+
+  test("getPartitionsByFilter: chunk in ('ab', 'ba') and ((cast(ds as string)>'20170102')") {
+    val day = (20170101 to 20170103, 0 to 23, Seq("ab", "ba"))
+    testMetastorePartitionFiltering(
+      attr("chunk").in("ab", "ba") && (attr("ds").cast(StringType) > "20170102"),
+      day :: Nil)
   }
 
   private def testMetastorePartitionFiltering(

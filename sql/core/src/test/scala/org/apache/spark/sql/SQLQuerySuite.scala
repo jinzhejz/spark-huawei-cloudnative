@@ -29,6 +29,7 @@ import org.apache.spark.sql.execution.aggregate
 import org.apache.spark.sql.execution.aggregate.{HashAggregateExec, SortAggregateExec}
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
 import org.apache.spark.sql.execution.datasources.FilePartition
+import org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, CartesianProductExec, SortMergeJoinExec}
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -3033,6 +3034,175 @@ class SQLQuerySuite extends QueryTest with SharedSQLContext {
       }
     }
 
+  }
+
+  test("SPARK-29213: FilterExec should not throw NPE") {
+    withTempView("t1", "t2", "t3") {
+      sql("SELECT ''").as[String].map(identity).toDF("x").createOrReplaceTempView("t1")
+      sql("SELECT * FROM VALUES 0, CAST(NULL AS BIGINT)")
+        .as[java.lang.Long]
+        .map(identity)
+        .toDF("x")
+        .createOrReplaceTempView("t2")
+      sql("SELECT ''").as[String].map(identity).toDF("x").createOrReplaceTempView("t3")
+      sql(
+        """
+          |SELECT t1.x
+          |FROM t1
+          |LEFT JOIN (
+          |    SELECT x FROM (
+          |        SELECT x FROM t2
+          |        UNION ALL
+          |        SELECT SUBSTR(x,5) x FROM t3
+          |    ) a
+          |    WHERE LENGTH(x)>0
+          |) t3
+          |ON t1.x=t3.x
+        """.stripMargin).collect()
+    }
+  }
+
+  test("SPARK-29682: Conflicting attributes in Expand are resolved") {
+    val numsDF = Seq(1, 2, 3).toDF("nums")
+    val cubeDF = numsDF.cube("nums").agg(max(lit(0)).as("agcol"))
+
+    checkAnswer(
+      cubeDF.join(cubeDF, "nums"),
+      Row(1, 0, 0) :: Row(2, 0, 0) :: Row(3, 0, 0) :: Nil)
+  }
+
+  test("SPARK-30447: fix constant propagation inside NOT") {
+    withTempView("t") {
+      Seq[Integer](1, null).toDF("c").createOrReplaceTempView("t")
+      val df = sql("SELECT * FROM t WHERE NOT(c = 1 AND c + 1 = 1)")
+
+      checkAnswer(df, Row(1))
+    }
+  }
+
+  test("SPARK-32372: ResolveReferences.dedupRight should only rewrite attributes for ancestor " +
+    "plans of the conflict plan") {
+    sql("SELECT name, avg(age) as avg_age FROM person GROUP BY name")
+      .createOrReplaceTempView("person_a")
+    sql("SELECT p1.name, p2.avg_age FROM person p1 JOIN person_a p2 ON p1.name = p2.name")
+      .createOrReplaceTempView("person_b")
+    sql("SELECT * FROM person_a UNION SELECT * FROM person_b")
+      .createOrReplaceTempView("person_c")
+    checkAnswer(
+      sql("SELECT p1.name, p2.avg_age FROM person_c p1 JOIN person_c p2 ON p1.name = p2.name"),
+      Row("jim", 20.0) :: Row("mike", 30.0) :: Nil)
+  }
+
+  test("SPARK-32280: Avoid duplicate rewrite attributes when there're multiple JOINs") {
+    withSQLConf(SQLConf.CROSS_JOINS_ENABLED.key -> "true") {
+      sql("SELECT 1 AS id").createOrReplaceTempView("A")
+      sql("SELECT id, 'foo' AS kind FROM A").createOrReplaceTempView("B")
+      sql("SELECT l.id as id FROM B AS l LEFT SEMI JOIN B AS r ON l.kind = r.kind")
+        .createOrReplaceTempView("C")
+      checkAnswer(sql("SELECT 0 FROM ( SELECT * FROM B JOIN C USING (id)) " +
+        "JOIN ( SELECT * FROM B JOIN C USING (id)) USING (id)"), Row(0))
+    }
+  }
+
+  test("SPARK-33338: GROUP BY using literal map should not fail") {
+    withTempDir { dir =>
+      sql(s"CREATE TABLE t USING ORC LOCATION '${dir.toURI}' AS SELECT map('k1', 'v1') m, 'k1' k")
+      Seq(
+        "SELECT map('k1', 'v1')[k] FROM t GROUP BY 1",
+        "SELECT map('k1', 'v1')[k] FROM t GROUP BY map('k1', 'v1')[k]",
+        "SELECT map('k1', 'v1')[k] a FROM t GROUP BY a").foreach { statement =>
+        checkAnswer(sql(statement), Row("v1"))
+      }
+    }
+  }
+
+  test("SPARK-33593: Vector reader got incorrect data with binary partition value") {
+    Seq("false", "true").foreach(value => {
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> value) {
+        withTable("t1") {
+          sql(
+            """CREATE TABLE t1(name STRING, id BINARY, part BINARY)
+              |USING PARQUET PARTITIONED BY (part)""".stripMargin)
+          sql("INSERT INTO t1 PARTITION(part = 'Spark SQL') VALUES('a', X'537061726B2053514C')")
+          checkAnswer(sql("SELECT name, cast(id as string), cast(part as string) FROM t1"),
+            Row("a", "Spark SQL", "Spark SQL"))
+        }
+      }
+
+      withSQLConf(SQLConf.ORC_VECTORIZED_READER_ENABLED.key -> value) {
+        withTable("t2") {
+          sql(
+            """CREATE TABLE t2(name STRING, id BINARY, part BINARY)
+              |USING ORC PARTITIONED BY (part)""".stripMargin)
+          sql("INSERT INTO t2 PARTITION(part = 'Spark SQL') VALUES('a', X'537061726B2053514C')")
+          checkAnswer(sql("SELECT name, cast(id as string), cast(part as string) FROM t2"),
+            Row("a", "Spark SQL", "Spark SQL"))
+        }
+      }
+    })
+  }
+
+  test("SPARK-34212 Parquet should read decimals correctly") {
+    def readParquet(schema: String, path: File): DataFrame = {
+      spark.read.schema(schema).parquet(path.toString)
+    }
+
+    withTempPath { path =>
+      // a is int-decimal (4 bytes), b is long-decimal (8 bytes), c is binary-decimal (16 bytes)
+      val df = sql("SELECT 1.0 a, CAST(1.23 AS DECIMAL(17, 2)) b, CAST(1.23 AS DECIMAL(36, 2)) c")
+      df.write.parquet(path.toString)
+
+      Seq(true, false).foreach { vectorizedReader =>
+        withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> vectorizedReader.toString) {
+          // We can read the decimal parquet field with a larger precision, if scale is the same.
+          val schema = "a DECIMAL(9, 1), b DECIMAL(18, 2), c DECIMAL(38, 2)"
+          checkAnswer(readParquet(schema, path), df)
+        }
+      }
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false") {
+        val schema1 = "a DECIMAL(3, 2), b DECIMAL(18, 3), c DECIMAL(37, 3)"
+        checkAnswer(readParquet(schema1, path), df)
+        val schema2 = "a DECIMAL(3, 0), b DECIMAL(18, 1), c DECIMAL(37, 1)"
+        checkAnswer(readParquet(schema2, path), Row(1, 1.2, 1.2))
+      }
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+        Seq("a DECIMAL(3, 2)", "b DECIMAL(18, 1)", "c DECIMAL(37, 1)").foreach { schema =>
+          val e = intercept[SparkException] {
+            readParquet(schema, path).collect()
+          }.getCause.getCause
+          assert(e.isInstanceOf[SchemaColumnConvertNotSupportedException])
+        }
+      }
+    }
+
+    // tests for parquet types without decimal metadata.
+    withTempPath { path =>
+      val df = sql(s"SELECT 1 a, 123456 b, ${Int.MaxValue.toLong * 10} c, CAST('1.2' AS BINARY) d")
+      df.write.parquet(path.toString)
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "false") {
+        checkAnswer(readParquet("a DECIMAL(3, 2)", path), sql("SELECT 1.00"))
+        checkAnswer(readParquet("b DECIMAL(3, 2)", path), Row(null))
+        checkAnswer(readParquet("b DECIMAL(11, 1)", path), sql("SELECT 123456.0"))
+        checkAnswer(readParquet("c DECIMAL(11, 1)", path), Row(null))
+        checkAnswer(readParquet("c DECIMAL(13, 0)", path), df.select("c"))
+        val e = intercept[SparkException] {
+          readParquet("d DECIMAL(3, 2)", path).collect()
+        }.getCause
+        assert(e.getMessage.contains("Please read this column/field as Spark BINARY type"))
+      }
+
+      withSQLConf(SQLConf.PARQUET_VECTORIZED_READER_ENABLED.key -> "true") {
+        Seq("a DECIMAL(3, 2)", "c DECIMAL(18, 1)", "d DECIMAL(37, 1)").foreach { schema =>
+          val e = intercept[SparkException] {
+            readParquet(schema, path).collect()
+          }.getCause.getCause
+          assert(e.isInstanceOf[SchemaColumnConvertNotSupportedException])
+        }
+      }
+    }
   }
 }
 

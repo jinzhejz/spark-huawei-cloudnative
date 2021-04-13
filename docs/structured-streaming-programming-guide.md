@@ -957,8 +957,8 @@ Dataset<Row> words = ... // streaming DataFrame of schema { timestamp: Timestamp
 Dataset<Row> windowedCounts = words
     .withWatermark("timestamp", "10 minutes")
     .groupBy(
-        functions.window(words.col("timestamp"), "10 minutes", "5 minutes"),
-        words.col("word"))
+        window(col("timestamp"), "10 minutes", "5 minutes"),
+        col("word"))
     .count();
 {% endhighlight %}
 
@@ -1089,7 +1089,7 @@ val staticDf = spark.read. ...
 val streamingDf = spark.readStream. ...
 
 streamingDf.join(staticDf, "type")          // inner equi-join with a static DF
-streamingDf.join(staticDf, "type", "right_join")  // right outer join with a static DF  
+streamingDf.join(staticDf, "type", "left_outer")  // left outer join with a static DF
 
 {% endhighlight %}
 
@@ -1100,7 +1100,7 @@ streamingDf.join(staticDf, "type", "right_join")  // right outer join with a sta
 Dataset<Row> staticDf = spark.read(). ...;
 Dataset<Row> streamingDf = spark.readStream(). ...;
 streamingDf.join(staticDf, "type");         // inner equi-join with a static DF
-streamingDf.join(staticDf, "type", "right_join");  // right outer join with a static DF
+streamingDf.join(staticDf, "type", "left_outer");  // left outer join with a static DF
 {% endhighlight %}
 
 
@@ -1111,7 +1111,7 @@ streamingDf.join(staticDf, "type", "right_join");  // right outer join with a st
 staticDf = spark.read. ...
 streamingDf = spark.readStream. ...
 streamingDf.join(staticDf, "type")  # inner equi-join with a static DF
-streamingDf.join(staticDf, "type", "right_join")  # right outer join with a static DF
+streamingDf.join(staticDf, "type", "left_outer")  # left outer join with a static DF
 {% endhighlight %}
 
 </div>
@@ -1123,10 +1123,10 @@ staticDf <- read.df(...)
 streamingDf <- read.stream(...)
 joined <- merge(streamingDf, staticDf, sort = FALSE)  # inner equi-join with a static DF
 joined <- join(
+            streamingDf,
             staticDf,
-            streamingDf, 
             streamingDf$value == staticDf$value,
-            "right_outer")  # right outer join with a static DF
+            "left_outer")  # left outer join with a static DF
 {% endhighlight %}
 
 </div>
@@ -1567,10 +1567,18 @@ be tolerated for stateful operations. You specify these thresholds using
 ``withWatermarks("eventTime", delay)`` on each of the input streams. For example, consider
 a query with stream-stream joins between `inputStream1` and `inputStream2`.
     
-  inputStream1.withWatermark("eventTime1", "1 hour")
-    .join(
-      inputStream2.withWatermark("eventTime2", "2 hours"),
-      joinCondition)
+<div class="codetabs">
+<div data-lang="scala"  markdown="1">
+
+{% highlight scala %}
+inputStream1.withWatermark("eventTime1", "1 hour")
+  .join(
+    inputStream2.withWatermark("eventTime2", "2 hours"),
+    joinCondition)
+{% endhighlight %}
+
+</div>
+</div>
 
 While executing the query, Structured Streaming individually tracks the maximum
 event time seen in each input stream, calculates watermarks based on the corresponding delay,
@@ -2051,7 +2059,7 @@ streamingDF.writeStream.foreachBatch { (batchDF: DataFrame, batchId: Long) =>
 
 {% highlight java %}
 streamingDatasetOfString.writeStream().foreachBatch(
-  new VoidFunction2<Dataset<String>, Long> {
+  new VoidFunction2<Dataset<String>, Long>() {
     public void call(Dataset<String> dataset, Long batchId) {
       // Transform and write batchDF
     }    
@@ -2148,7 +2156,7 @@ streamingDatasetOfString.writeStream.foreach(
 In Java, you have to extend the class `ForeachWriter` ([docs](api/java/org/apache/spark/sql/ForeachWriter.html)).
 {% highlight java %}
 streamingDatasetOfString.writeStream().foreach(
-  new ForeachWriter[String] {
+  new ForeachWriter<String>() {
 
     @Override public boolean open(long partitionId, long version) {
       // Open connection

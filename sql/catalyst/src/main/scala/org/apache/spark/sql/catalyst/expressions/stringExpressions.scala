@@ -45,11 +45,13 @@ import org.apache.spark.unsafe.types.{ByteArray, UTF8String}
  */
 // scalastyle:off line.size.limit
 @ExpressionDescription(
-  usage = "_FUNC_(sep, [str | array(str)]+) - Returns the concatenation of the strings separated by `sep`.",
+  usage = "_FUNC_(sep[, str | array(str)]+) - Returns the concatenation of the strings separated by `sep`.",
   examples = """
     Examples:
       > SELECT _FUNC_(' ', 'Spark', 'SQL');
         Spark SQL
+      > SELECT _FUNC_('s');
+
   """,
   since = "1.5.0")
 // scalastyle:on line.size.limit
@@ -569,11 +571,22 @@ case class FindInSet(left: Expression, right: Expression) extends BinaryExpressi
 
 trait String2TrimExpression extends Expression with ImplicitCastInputTypes {
 
+  protected def srcStr: Expression
+  protected def trimStr: Option[Expression]
+
+  override def children: Seq[Expression] = srcStr +: trimStr.toSeq
   override def dataType: DataType = StringType
   override def inputTypes: Seq[AbstractDataType] = Seq.fill(children.size)(StringType)
 
   override def nullable: Boolean = children.exists(_.nullable)
   override def foldable: Boolean = children.forall(_.foldable)
+
+  // To match the actual parameter order.
+  override def sql: String = if (trimStr.isDefined) {
+    s"$prettyName(${trimStr.get.sql}, ${srcStr.sql})"
+  } else {
+    super.sql
+  }
 }
 
 object StringTrim {
@@ -641,11 +654,6 @@ case class StringTrim(
 
   override def prettyName: String = "trim"
 
-  override def children: Seq[Expression] = if (trimStr.isDefined) {
-    srcStr :: trimStr.get :: Nil
-  } else {
-    srcStr :: Nil
-  }
   override def eval(input: InternalRow): Any = {
     val srcString = srcStr.eval(input).asInstanceOf[UTF8String]
     if (srcString == null) {
@@ -740,12 +748,6 @@ case class StringTrimLeft(
   def this(srcStr: Expression) = this(srcStr, None)
 
   override def prettyName: String = "ltrim"
-
-  override def children: Seq[Expression] = if (trimStr.isDefined) {
-    srcStr :: trimStr.get :: Nil
-  } else {
-    srcStr :: Nil
-  }
 
   override def eval(input: InternalRow): Any = {
     val srcString = srcStr.eval(input).asInstanceOf[UTF8String]
@@ -843,12 +845,6 @@ case class StringTrimRight(
   def this(srcStr: Expression) = this(srcStr, None)
 
   override def prettyName: String = "rtrim"
-
-  override def children: Seq[Expression] = if (trimStr.isDefined) {
-    srcStr :: trimStr.get :: Nil
-  } else {
-    srcStr :: Nil
-  }
 
   override def eval(input: InternalRow): Any = {
     val srcString = srcStr.eval(input).asInstanceOf[UTF8String]

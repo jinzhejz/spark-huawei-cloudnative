@@ -169,7 +169,7 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with SharedSQLContext
   }
 
   test("SPARK-1669: cacheTable should be idempotent") {
-    assume(!spark.table("testData").logicalPlan.isInstanceOf[InMemoryRelation])
+    assert(!spark.table("testData").logicalPlan.isInstanceOf[InMemoryRelation])
 
     spark.catalog.cacheTable("testData")
     assertCached(spark.table("testData"))
@@ -862,6 +862,114 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with SharedSQLContext
         assert(!spark.catalog.isCached("t"))
         assert(!spark.catalog.isCached("t1"))
         assert(!spark.catalog.isCached("t2"))
+      }
+    }
+  }
+
+  test("SPARK-30494 Fix the leak of cached data when replace an existing view") {
+    withTempView("tempView") {
+      spark.catalog.clearCache()
+      sql("create or replace temporary view tempView as select 1")
+      sql("cache table tempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1")).isDefined)
+      sql("create or replace temporary view tempView as select 1, 2")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1")).isEmpty)
+      sql("cache table tempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1, 2")).isDefined)
+    }
+
+    withGlobalTempView("tempGlobalTempView") {
+      spark.catalog.clearCache()
+      sql("create or replace global temporary view tempGlobalTempView as select 1")
+      sql("cache table global_temp.tempGlobalTempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1")).isDefined)
+      sql("create or replace global temporary view tempGlobalTempView as select 1, 2")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1")).isEmpty)
+      sql("cache table global_temp.tempGlobalTempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(sql("select 1, 2")).isDefined)
+    }
+
+    withView("view1") {
+      spark.catalog.clearCache()
+      sql("create or replace view view1 as select 1")
+      sql("cache table view1")
+      sql("create or replace view view1 as select 1, 2")
+      sql("cache table view1")
+      // the cached plan of persisted view likes below,
+      // we cannot use the same assertion of temp view.
+      // SubqueryAlias
+      //    |
+      //    + View
+      //        |
+      //        + Project[1 AS 1]
+      spark.sharedState.cacheManager.uncacheQuery(spark.table("view1"), cascade = false)
+      // make sure there is no cached data leak
+      assert(spark.sharedState.cacheManager.isEmpty)
+    }
+  }
+
+  test("SPARK-33228: Don't uncache data when replacing an existing view having the same plan") {
+    withTempView("tempView") {
+      spark.catalog.clearCache()
+      val df = spark.range(1).selectExpr("id a", "id b")
+      df.cache()
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+      df.createOrReplaceTempView("tempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+      df.createOrReplaceTempView("tempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+    }
+
+    withTempView("tempGlobalTempView") {
+      spark.catalog.clearCache()
+      val df = spark.range(1).selectExpr("id a", "id b")
+      df.cache()
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+      df.createOrReplaceGlobalTempView("tempGlobalTempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+      df.createOrReplaceGlobalTempView("tempGlobalTempView")
+      assert(spark.sharedState.cacheManager.lookupCachedData(df).isDefined)
+    }
+  }
+
+  test("SPARK-33290: REFRESH TABLE should invalidate all caches referencing the table") {
+    withTable("t") {
+      withTempPath { path =>
+        withTempView("tempView1", "tempView2") {
+          Seq((1 -> "a")).toDF("i", "j").write.parquet(path.getCanonicalPath)
+          sql(s"CREATE TABLE t USING parquet LOCATION '${path.toURI}'")
+          sql("CREATE TEMPORARY VIEW tempView1 AS SELECT * FROM t")
+          sql("CACHE TABLE tempView2 AS SELECT i FROM tempView1")
+          checkAnswer(sql("SELECT * FROM tempView1"), Seq(Row(1, "a")))
+          checkAnswer(sql("SELECT * FROM tempView2"), Seq(Row(1)))
+
+          Utils.deleteRecursively(path)
+          sql("REFRESH TABLE tempView1")
+          checkAnswer(sql("SELECT * FROM tempView1"), Seq.empty)
+          checkAnswer(sql("SELECT * FROM tempView2"), Seq.empty)
+        }
+      }
+    }
+  }
+
+  test("SPARK-33290: querying temporary view after REFRESH TABLE fails with FNFE") {
+    withTable("t") {
+      withTempPath { path =>
+        withTempView("tempView1") {
+          Seq((1 -> "a")).toDF("i", "j").write.parquet(path.getCanonicalPath)
+          sql(s"CREATE TABLE t USING parquet LOCATION '${path.toURI}'")
+          sql("CREATE TEMPORARY VIEW tempView1 AS SELECT * FROM t")
+          checkAnswer(sql("SELECT * FROM tempView1"), Seq(Row(1, "a")))
+
+          Utils.deleteRecursively(path)
+          sql("REFRESH TABLE t")
+          checkAnswer(sql("SELECT * FROM t"), Seq.empty)
+          val exception = intercept[Exception] {
+            checkAnswer(sql("SELECT * FROM tempView1"), Seq.empty)
+          }
+          assert(exception.getMessage.contains("FileNotFoundException"))
+          assert(exception.getMessage.contains("REFRESH TABLE"))
+        }
       }
     }
   }

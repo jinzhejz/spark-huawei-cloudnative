@@ -26,6 +26,7 @@ import org.apache.spark.sql.catalyst.catalog.{CatalogStorageFormat, CatalogTable
 import org.apache.spark.sql.catalyst.expressions.{Alias, SubqueryExpression}
 import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, Project, View}
+import org.apache.spark.sql.internal.StaticSQLConf
 import org.apache.spark.sql.types.MetadataBuilder
 import org.apache.spark.sql.util.SchemaUtils
 
@@ -143,9 +144,21 @@ case class CreateViewCommand(
     val catalog = sparkSession.sessionState.catalog
     if (viewType == LocalTempView) {
       val aliasedPlan = aliasPlan(sparkSession, analyzedPlan)
+      if (replace && catalog.getTempView(name.table).isDefined &&
+          !catalog.getTempView(name.table).get.sameResult(aliasedPlan)) {
+        logInfo(s"Try to uncache ${name.quotedString} before replacing.")
+        CommandUtils.uncacheTableOrView(sparkSession, name.quotedString)
+      }
       catalog.createTempView(name.table, aliasedPlan, overrideIfExists = replace)
     } else if (viewType == GlobalTempView) {
       val aliasedPlan = aliasPlan(sparkSession, analyzedPlan)
+      if (replace && catalog.getGlobalTempView(name.table).isDefined &&
+          !catalog.getGlobalTempView(name.table).get.sameResult(aliasedPlan)) {
+        val db = sparkSession.sessionState.conf.getConf(StaticSQLConf.GLOBAL_TEMP_DATABASE)
+        val globalTempView = TableIdentifier(name.table, Option(db))
+        logInfo(s"Try to uncache ${globalTempView.quotedString} before replacing.")
+        CommandUtils.uncacheTableOrView(sparkSession, globalTempView.quotedString)
+      }
       catalog.createGlobalTempView(name.table, aliasedPlan, overrideIfExists = replace)
     } else if (catalog.tableExists(name)) {
       val tableMetadata = catalog.getTableMetadata(name)
@@ -158,6 +171,10 @@ case class CreateViewCommand(
         // Detect cyclic view reference on CREATE OR REPLACE VIEW.
         val viewIdent = tableMetadata.identifier
         checkCyclicViewReference(analyzedPlan, Seq(viewIdent), viewIdent)
+
+        // uncache the cached data before replacing an exists view
+        logDebug(s"Try to uncache ${viewIdent.quotedString} before replacing.")
+        CommandUtils.uncacheTableOrView(sparkSession, viewIdent.quotedString)
 
         // Handles `CREATE OR REPLACE VIEW v0 AS SELECT ...`
         // Nothing we need to retain from the old view, so just drop and create a new one
@@ -233,14 +250,15 @@ case class CreateViewCommand(
       throw new AnalysisException(
         "It is not allowed to create a persisted view from the Dataset API")
     }
-
-    val newProperties = generateViewProperties(properties, session, analyzedPlan)
+    val aliasedSchema = aliasPlan(session, analyzedPlan).schema
+    val newProperties = generateViewProperties(
+      properties, session, analyzedPlan, aliasedSchema.fieldNames)
 
     CatalogTable(
       identifier = name,
       tableType = CatalogTableType.VIEW,
       storage = CatalogStorageFormat.empty,
-      schema = aliasPlan(session, analyzedPlan).schema,
+      schema = aliasedSchema,
       properties = newProperties,
       viewText = originalText,
       comment = comment
@@ -294,7 +312,8 @@ case class AlterViewAsCommand(
     val viewIdent = viewMeta.identifier
     checkCyclicViewReference(analyzedPlan, Seq(viewIdent), viewIdent)
 
-    val newProperties = generateViewProperties(viewMeta.properties, session, analyzedPlan)
+    val newProperties = generateViewProperties(
+      viewMeta.properties, session, analyzedPlan, analyzedPlan.schema.fieldNames)
 
     val updatedViewMeta = viewMeta.copy(
       schema = analyzedPlan.schema,
@@ -355,13 +374,15 @@ object ViewHelper {
   def generateViewProperties(
       properties: Map[String, String],
       session: SparkSession,
-      analyzedPlan: LogicalPlan): Map[String, String] = {
+      analyzedPlan: LogicalPlan,
+      fieldNames: Array[String]): Map[String, String] = {
+    // for createViewCommand queryOutput may be different from fieldNames
     val queryOutput = analyzedPlan.schema.fieldNames
 
     // Generate the query column names, throw an AnalysisException if there exists duplicate column
     // names.
     SchemaUtils.checkColumnNameDuplication(
-      queryOutput, "in the view definition", session.sessionState.conf.resolver)
+      fieldNames, "in the view definition", session.sessionState.conf.resolver)
 
     // Generate the view default database name.
     val viewDefaultDatabase = session.sessionState.catalog.getCurrentDatabase
