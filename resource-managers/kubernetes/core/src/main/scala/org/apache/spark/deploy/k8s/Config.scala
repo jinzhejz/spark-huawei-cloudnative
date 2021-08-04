@@ -294,4 +294,10 @@ private[spark] object Config extends Logging {
     .doc("Amount of cpu to use for the podgroup minResource")
     .doubleConf
     .createWithDefault(2.0)
+
+  val KUBERNETES_SPARK_UI_HOST_POSTFIX =
+    ConfigBuilder("spark.kubernetes.sparkui.postfix")
+      .doc("postfix for spark-ui host url, leave it empty to disable this feature")
+      .stringConf
+      .createWithDefault("")
 }
