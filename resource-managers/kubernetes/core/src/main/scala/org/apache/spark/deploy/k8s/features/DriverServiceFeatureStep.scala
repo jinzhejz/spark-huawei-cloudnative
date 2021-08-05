@@ -19,8 +19,10 @@ package org.apache.spark.deploy.k8s.features
 import scala.collection.JavaConverters._
 
 import io.fabric8.kubernetes.api.model.{HasMetadata, ServiceBuilder}
+import io.fabric8.kubernetes.api.model.extensions.IngressBuilder
 
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesDriverSpecificConf, SparkPod}
+import org.apache.spark.deploy.k8s.Config.KUBERNETES_SPARK_UI_HOST_POSTFIX
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.internal.Logging
 import org.apache.spark.util.{Clock, SystemClock}
@@ -50,10 +52,41 @@ private[spark] class DriverServiceFeatureStep(
     shorterServiceName
   }
 
+  private val preferredUIServiceName = s"${kubernetesConf.appResourceNamePrefix}$UI_SVC_POSTFIX"
+  private val resolvedUIServiceName = if (preferredUIServiceName.length <= MAX_SERVICE_NAME_LENGTH) {
+    preferredUIServiceName
+  } else {
+    val randomServiceId = clock.getTimeMillis()
+    val shorterServiceName = s"spark-$randomServiceId$UI_SVC_POSTFIX"
+    logWarning(s"Driver's hostname would preferably be $preferredUIServiceName, but this is " +
+      s"too long (must be <= $MAX_SERVICE_NAME_LENGTH characters). Falling back to use " +
+      s"$shorterServiceName as the driver service's name.")
+    shorterServiceName
+  }
+
+  private val preferredUIIngressName = s"${kubernetesConf.appResourceNamePrefix}$UI_INGRESS_POSTFIX"
+  private val resolvedUIIngressName = if (preferredUIIngressName.length <= MAX_SERVICE_NAME_LENGTH) {
+    preferredUIIngressName
+  } else {
+    val randomIngressId = clock.getTimeMillis()
+    val shorterIngressName = s"spark-$randomIngressId$UI_INGRESS_POSTFIX"
+    logWarning(s"Driver's hostname would preferably be $preferredUIIngressName, but this is " +
+      s"too long (must be <= $MAX_SERVICE_NAME_LENGTH characters). Falling back to use " +
+      s"$shorterIngressName as the driver ingress's name.")
+    shorterIngressName
+  }
+
   private val driverPort = kubernetesConf.sparkConf.getInt(
     "spark.driver.port", DEFAULT_DRIVER_PORT)
   private val driverBlockManagerPort = kubernetesConf.sparkConf.getInt(
     org.apache.spark.internal.config.DRIVER_BLOCK_MANAGER_PORT.key, DEFAULT_BLOCKMANAGER_PORT)
+  private val driverUiPort = 4040
+  private val userDriverPostfix = kubernetesConf.sparkConf.get(KUBERNETES_SPARK_UI_HOST_POSTFIX)
+  private val resolvedDriverPostfix = if (userDriverPostfix.startsWith(".")) {
+    userDriverPostfix
+  } else {
+    "." + userDriverPostfix
+  }
 
   override def configurePod(pod: SparkPod): SparkPod = pod
 
@@ -63,6 +96,47 @@ private[spark] class DriverServiceFeatureStep(
       "spark.driver.port" -> driverPort.toString,
       org.apache.spark.internal.config.DRIVER_BLOCK_MANAGER_PORT.key ->
         driverBlockManagerPort.toString)
+  }
+
+  def buildIngress(): Seq[HasMetadata] = {
+    val uiService = new ServiceBuilder()
+      .withNewMetadata()
+        .withName(resolvedUIServiceName)
+      .endMetadata()
+      .withNewSpec()
+        .withClusterIP("None")
+        .withSelector(kubernetesConf.roleLabels.asJava)
+        .addNewPort()
+          .withName(DRIVER_PORT_NAME)
+          .withPort(driverUiPort)
+          .withNewTargetPort(driverUiPort)
+        .endPort()
+      .endSpec()
+      .build()
+
+    val uiIngress = new IngressBuilder()
+      .withNewMetadata()
+        .withName(resolvedUIIngressName)
+      .endMetadata()
+      .withNewSpec()
+        .withRules()
+        .addNewRule()
+          .withHost(s"${kubernetesConf.appResourceNamePrefix}${resolvedDriverPostfix}")
+          .withNewHttp()
+            .withPaths()
+            .addNewPath()
+              .withPath("/")
+              .withNewBackend()
+                .withServiceName(resolvedUIServiceName)
+                .withNewServicePort(driverUiPort)
+              .endBackend()
+            .endPath()
+          .endHttp()
+        .endRule()
+      .endSpec()
+      .build()
+
+    Seq(uiService, uiIngress)
   }
 
   override def getAdditionalKubernetesResources(): Seq[HasMetadata] = {
@@ -85,7 +159,13 @@ private[spark] class DriverServiceFeatureStep(
           .endPort()
         .endSpec()
       .build()
-    Seq(driverService)
+
+    var res = Seq[HasMetadata](driverService)
+    if ("" != userDriverPostfix) {
+      res = res ++ buildIngress()
+    }
+
+    res
   }
 }
 
@@ -93,5 +173,7 @@ private[spark] object DriverServiceFeatureStep {
   val DRIVER_BIND_ADDRESS_KEY = org.apache.spark.internal.config.DRIVER_BIND_ADDRESS.key
   val DRIVER_HOST_KEY = org.apache.spark.internal.config.DRIVER_HOST_ADDRESS.key
   val DRIVER_SVC_POSTFIX = "-driver-svc"
+  val UI_SVC_POSTFIX = "-ui-svc"
+  val UI_INGRESS_POSTFIX = "-ui-ingress"
   val MAX_SERVICE_NAME_LENGTH = 63
 }
