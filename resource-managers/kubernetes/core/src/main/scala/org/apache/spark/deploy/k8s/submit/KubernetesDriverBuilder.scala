@@ -17,9 +17,12 @@
 package org.apache.spark.deploy.k8s.submit
 
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesDriverSpec, KubernetesDriverSpecificConf, KubernetesRoleSpecificConf}
-import org.apache.spark.deploy.k8s.Config.KUBERNETES_VOLCANO_ENABLE
-import org.apache.spark.deploy.k8s.features.{BasicDriverFeatureStep, DriverKubernetesCredentialsFeatureStep, DriverServiceFeatureStep, EnvSecretsFeatureStep, LocalDirsFeatureStep, MountSecretsFeatureStep, MountVolumesFeatureStep, VolcanoFeatureStep}
+import org.apache.spark.deploy.k8s.Config.{KUBERNETES_VOLCANO_ENABLE, KUBERNETES_POD_HOSTALIASES}
+import org.apache.spark.deploy.k8s.features.{BasicDriverFeatureStep, DriverKubernetesCredentialsFeatureStep, DriverServiceFeatureStep, EnvSecretsFeatureStep, HostAliasesFeatureStep, LocalDirsFeatureStep, MountSecretsFeatureStep, MountVolumesFeatureStep, VolcanoFeatureStep}
 import org.apache.spark.deploy.k8s.features.bindings.{JavaDriverFeatureStep, PythonDriverFeatureStep, RDriverFeatureStep}
+
+import io.fabric8.kubernetes.api.model._
+import scala.collection.JavaConverters._
 
 private[spark] class KubernetesDriverBuilder(
     provideBasicStep: (KubernetesConf[KubernetesDriverSpecificConf]) => BasicDriverFeatureStep =
@@ -56,7 +59,11 @@ private[spark] class KubernetesDriverBuilder(
     volcanoStep: (
       KubernetesConf[KubernetesDriverSpecificConf]
         => VolcanoFeatureStep) =
-    new VolcanoFeatureStep(_)) {  
+    new VolcanoFeatureStep(_),
+    hostAliasesStep: (
+      KubernetesConf[KubernetesDriverSpecificConf]
+        => HostAliasesFeatureStep) =
+    new HostAliasesFeatureStep(_)) {  
 
   def buildFromFeatures(
     kubernetesConf: KubernetesConf[KubernetesDriverSpecificConf]): KubernetesDriverSpec = {
@@ -89,8 +96,12 @@ private[spark] class KubernetesDriverBuilder(
       Seq(volcanoStep(kubernetesConf))
     } else Nil
 
+    val hostAliasesFeature = if (kubernetesConf.sparkConf.get(KUBERNETES_POD_HOSTALIASES).getOrElse("") != "") {
+      Seq(hostAliasesStep(kubernetesConf))
+    } else Nil
+
     val allFeatures = (baseFeatures :+ bindingsStep) ++
-      secretFeature ++ envSecretFeature ++ volumesFeature ++ volcanoFeature
+      secretFeature ++ envSecretFeature ++ volumesFeature ++ volcanoFeature ++ hostAliasesFeature
 
     var spec = KubernetesDriverSpec.initialSpec(kubernetesConf.sparkConf.getAll.toMap)
     for (feature <- allFeatures) {

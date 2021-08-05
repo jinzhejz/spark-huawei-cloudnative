@@ -300,4 +300,12 @@ private[spark] object Config extends Logging {
       .doc("postfix for spark-ui host url, leave it empty to disable this feature")
       .stringConf
       .createWithDefault("")
+
+  // host1:1.1.1.1,host2:2.2.2.2
+  val KUBERNETES_POD_HOSTALIASES =
+    ConfigBuilder("spark.kubernetes.pod.hostAliases")
+    .doc("This sets host aliases for driver and executor")
+    .internal()
+    .stringConf
+    .createOptional
 }
